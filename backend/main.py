@@ -43,15 +43,17 @@ SEARCH_QUERY_TEMPLATE = "{query} 夸克网盘"
 
 
 def extract_quark_links(text: str, base_url: str = "") -> list[str]:
-    """从文本中提取所有 quark.cn 链接"""
-    pattern = r'https?://[^\s"\'<>]*quark\.cn[^\s"\'<>]*'
+    """从文本中提取所有 quark.cn 分享链接（仅 /s/ 格式）"""
+    # 只匹配 pan.quark.cn/s/xxxxx 格式的分享链接
+    pattern = r'https?://pan\.quark\.cn/s/[a-zA-Z0-9_\-]+'
     links = re.findall(pattern, text)
-    # 去重并清理
+    # 也匹配可能出现的 quark.cn/s/ 格式（不带 pan 子域名）
+    pattern2 = r'https?://(?:www\.)?quark\.cn/s/[a-zA-Z0-9_\-]+'
+    links.extend(re.findall(pattern2, text))
+    # 去重
     seen = set()
     result = []
     for link in links:
-        # 清理尾部标点
-        link = re.sub(r'[,;.!?。，；！？)\]>}\'"]+$', '', link)
         if link not in seen:
             seen.add(link)
             result.append(link)
@@ -59,8 +61,316 @@ def extract_quark_links(text: str, base_url: str = "") -> list[str]:
 
 
 def is_quark_share_url(url: str) -> bool:
-    """判断是否是夸克网盘分享链接"""
-    return 'quark.cn' in url and ('/s/' in url or 'share' in url.lower())
+    """判断是否是夸克网盘分享链接（仅 /s/ 格式）"""
+    return 'quark.cn' in url and '/s/' in url
+
+
+def decode_bing_redirect(bing_url: str) -> str:
+    """解码 Bing 重定向链接，提取真实 URL"""
+    import base64
+    try:
+        # Bing 重定向格式: https://www.bing.com/ck/a?...&u=a1aHR0cHM6Ly...
+        # u 参数前两个字符是前缀，后面是 base64 编码的真实 URL
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(bing_url)
+        params = parse_qs(parsed.query)
+        u_val = params.get('u', [''])[0]
+        if u_val and len(u_val) > 2:
+            # 去掉前2个字符前缀，base64 解码
+            b64_str = u_val[2:]
+            # 补齐 base64 padding
+            b64_str += '=' * (4 - len(b64_str) % 4) if len(b64_str) % 4 else ''
+            decoded = base64.b64decode(b64_str).decode('utf-8', errors='ignore')
+            if decoded.startswith('http'):
+                return decoded
+    except Exception:
+        pass
+    return bing_url  # 解码失败返回原 URL
+
+
+# ──────────────────── 剧集检测与集数比对 ────────────────────
+
+# 剧集编号正则模式（按优先级排序，匹配文件名中的集数）
+EPISODE_PATTERNS = [
+    r'第\s*0*(\d{1,3})\s*[集話话回篇]',
+    r'[Ee][Pp]\.?\s*0*(\d{1,3})\b',
+    r'[Ss]\d{1,2}[Ee]0*(\d{1,3})\b',
+    r'^0*(\d{1,3})\s*[\.．、]',
+    r'0*(\d{1,3})\s*集\b',
+    r'【0*(\d{1,3})】',
+    r'\[0*(\d{1,3})\]',
+    r'^0*(\d{1,3})\s',
+    r'0*(\d{1,3})\s*话\b',
+    r'第\s*0*(\d{1,3})\s*话\b',
+]
+
+# 集数搜索模式（用于从搜索结果文本中提取总集数）
+EPISODE_SEARCH_PATTERNS = [
+    r'集\s*数\s*[：:]\s*(\d{1,3})',
+    r'共\s*(\d{1,3})\s*集',
+    r'(\d{1,3})\s*集\s*全',
+    r'全\s*(\d{1,3})\s*集',
+    r'(\d{1,3})\s*集(?:电视剧|动漫|综艺|国产|韩剧|美剧|日剧)',
+    r'更新至\s*(\d{1,3})\s*集',
+    r'(\d{1,3})\s*集(?:完结|全)',
+]
+
+
+def parse_episode_number(filename: str) -> int | None:
+    """从文件名中解析剧集编号"""
+    for pattern in EPISODE_PATTERNS:
+        match = re.search(pattern, filename)
+        if match:
+            num = int(match.group(1))
+            if 0 < num < 1000:
+                return num
+    return None
+
+
+def extract_episodes_from_files(files: list[dict]) -> dict:
+    """从夸克资源文件列表中提取剧集信息"""
+    episodes = []
+    for f in files:
+        name = f.get('name', '')
+        ep_num = parse_episode_number(name)
+        if ep_num is not None:
+            episodes.append(ep_num)
+
+    episodes = sorted(set(episodes))
+
+    return {
+        'has_episodes': len(episodes) > 0,
+        'episode_list': episodes,
+        'episode_count': len(episodes),
+        'max_episode': max(episodes) if episodes else 0,
+        'min_episode': min(episodes) if episodes else 0,
+    }
+
+
+def compare_episodes(quark_info: dict, total_episodes: int) -> dict:
+    """比对夸克资源剧集与官方集数"""
+    if not quark_info.get('has_episodes') or total_episodes <= 0:
+        return {
+            'status': 'unknown',
+            'message': '无法从资源中识别剧集编号',
+            'quark_max': 0,
+            'quark_count': 0,
+            'official_total': total_episodes,
+            'missing_episodes': [],
+        }
+
+    quark_max = quark_info['max_episode']
+    quark_count = quark_info['episode_count']
+    found_set = set(quark_info['episode_list'])
+    all_set = set(range(1, total_episodes + 1))
+    missing = sorted(all_set - found_set)
+
+    if quark_count >= total_episodes and len(missing) == 0:
+        return {
+            'status': 'complete',
+            'message': f'剧集完整（{quark_count}/{total_episodes}集）',
+            'quark_max': quark_max,
+            'quark_count': quark_count,
+            'official_total': total_episodes,
+            'missing_episodes': [],
+        }
+    elif quark_max < total_episodes:
+        if missing:
+            missing_str = f'第{missing[0]}-{missing[-1]}集' if len(missing) > 1 else f'第{missing[0]}集'
+        else:
+            missing_str = ''
+        return {
+            'status': 'incomplete',
+            'message': f'可能未更新完（已到第{quark_max}集/共{total_episodes}集）'
+                       + (f'，缺少{missing_str}' if missing_str else ''),
+            'quark_max': quark_max,
+            'quark_count': quark_count,
+            'official_total': total_episodes,
+            'missing_episodes': missing,
+        }
+    else:
+        return {
+            'status': 'partial',
+            'message': f'有缺集（{quark_count}/{total_episodes}集）',
+            'quark_max': quark_max,
+            'quark_count': quark_count,
+            'official_total': total_episodes,
+            'missing_episodes': missing,
+        }
+
+
+async def detect_series_info(context, query: str) -> dict:
+    """
+    检测关键词是否为电视剧/动漫，并获取总集数
+    优先豆瓣，备用 Google/Bing，最后尝试爱奇艺/腾讯视频/优酷
+    """
+    result = {
+        'is_series': False,
+        'series_name': '',
+        'total_episodes': 0,
+        'source': '',
+        'url': '',
+        'query': query,
+    }
+
+    page = await context.new_page()
+
+    try:
+        # ──── 方式1: 豆瓣搜索 ────
+        try:
+            search_url = f'https://www.douban.com/search?q={quote(query)}&cat=1002'
+            await page.goto(search_url, wait_until='domcontentloaded', timeout=15000)
+            await asyncio.sleep(2)
+
+            subject_link = await page.evaluate('''
+                () => {
+                    const links = document.querySelectorAll('a[href*="movie.douban.com/subject/"]');
+                    for (const a of links) {
+                        if (a.href.match(/movie\\.douban\\.com\\/subject\\/\\d+/)) return a.href;
+                    }
+                    return null;
+                }
+            ''')
+
+            if subject_link:
+                await page.goto(subject_link, wait_until='domcontentloaded', timeout=15000)
+                await asyncio.sleep(2)
+
+                page_text = await page.evaluate('() => document.body.innerText')
+
+                ep_match = re.search(r'集\s*数\s*[：:]\s*(\d{1,3})', page_text)
+                if ep_match:
+                    total_eps = int(ep_match.group(1))
+                    title = await page.evaluate('() => document.querySelector("h1")?.textContent?.trim() || ""')
+                    result.update({
+                        'is_series': True,
+                        'series_name': title or query,
+                        'total_episodes': total_eps,
+                        'source': '豆瓣',
+                        'url': subject_link,
+                    })
+                    return result
+        except Exception:
+            pass
+
+        # ──── 方式2: Google 搜索 "{keyword} 多少集" ────
+        try:
+            search_query = f'{query} 多少集'
+            google_url = f'https://www.google.com/search?q={quote(search_query)}&hl=zh-CN&num=10'
+            await page.goto(google_url, wait_until='domcontentloaded', timeout=15000)
+            await asyncio.sleep(2)
+
+            title = await page.title()
+            if 'sorry' not in title.lower():
+                page_text = await page.evaluate('() => document.body.innerText')
+                for pattern in EPISODE_SEARCH_PATTERNS:
+                    match = re.search(pattern, page_text)
+                    if match:
+                        total_eps = int(match.group(1))
+                        result.update({
+                            'is_series': True,
+                            'series_name': query,
+                            'total_episodes': total_eps,
+                            'source': 'Google',
+                            'url': google_url,
+                        })
+                        return result
+        except Exception:
+            pass
+
+        # ──── 方式3: Bing 搜索 ────
+        try:
+            search_query = f'{query} 多少集'
+            bing_url = f'https://www.bing.com/search?q={quote(search_query)}&count=10'
+            await page.goto(bing_url, wait_until='domcontentloaded', timeout=15000)
+            await asyncio.sleep(2)
+
+            page_text = await page.evaluate('() => document.body.innerText')
+            for pattern in EPISODE_SEARCH_PATTERNS:
+                match = re.search(pattern, page_text)
+                if match:
+                    total_eps = int(match.group(1))
+                    result.update({
+                        'is_series': True,
+                        'series_name': query,
+                        'total_episodes': total_eps,
+                        'source': 'Bing',
+                        'url': bing_url,
+                    })
+                    return result
+        except Exception:
+            pass
+
+        # ──── 方式4: 爱奇艺搜索 ────
+        try:
+            iqiyi_url = f'https://so.iqiyi.com/so/q_{quote(query)}'
+            await page.goto(iqiyi_url, wait_until='domcontentloaded', timeout=15000)
+            await asyncio.sleep(2)
+
+            page_text = await page.evaluate('() => document.body.innerText')
+            for pattern in EPISODE_SEARCH_PATTERNS:
+                match = re.search(pattern, page_text)
+                if match:
+                    total_eps = int(match.group(1))
+                    result.update({
+                        'is_series': True,
+                        'series_name': query,
+                        'total_episodes': total_eps,
+                        'source': '爱奇艺',
+                        'url': iqiyi_url,
+                    })
+                    return result
+        except Exception:
+            pass
+
+        # ──── 方式5: 腾讯视频搜索 ────
+        try:
+            qq_url = f'https://v.qq.com/search?searchid={quote(query)}'
+            await page.goto(qq_url, wait_until='domcontentloaded', timeout=15000)
+            await asyncio.sleep(2)
+
+            page_text = await page.evaluate('() => document.body.innerText')
+            for pattern in EPISODE_SEARCH_PATTERNS:
+                match = re.search(pattern, page_text)
+                if match:
+                    total_eps = int(match.group(1))
+                    result.update({
+                        'is_series': True,
+                        'series_name': query,
+                        'total_episodes': total_eps,
+                        'source': '腾讯视频',
+                        'url': qq_url,
+                    })
+                    return result
+        except Exception:
+            pass
+
+        # ──── 方式6: 优酷搜索 ────
+        try:
+            youku_url = f'https://so.youku.com/search_video/q_{quote(query)}'
+            await page.goto(youku_url, wait_until='domcontentloaded', timeout=15000)
+            await asyncio.sleep(2)
+
+            page_text = await page.evaluate('() => document.body.innerText')
+            for pattern in EPISODE_SEARCH_PATTERNS:
+                match = re.search(pattern, page_text)
+                if match:
+                    total_eps = int(match.group(1))
+                    result.update({
+                        'is_series': True,
+                        'series_name': query,
+                        'total_episodes': total_eps,
+                        'source': '优酷',
+                        'url': youku_url,
+                    })
+                    return result
+        except Exception:
+            pass
+
+    finally:
+        await page.close()
+
+    return result
 
 
 async def search_with_playwright(query: str) -> AsyncGenerator[dict, None]:
@@ -104,107 +414,139 @@ async def search_with_playwright(query: str) -> AsyncGenerator[dict, None]:
 
             page = await context.new_page()
 
+            # ──── 剧集检测 ────
+            yield emit("progress", "正在检测剧集信息...")
+            series_info = await detect_series_info(context, query)
+            if series_info.get('is_series'):
+                yield emit("series_detected",
+                    f"检测到电视剧「{series_info['series_name']}」共 {series_info['total_episodes']} 集（来源: {series_info['source']}）",
+                    series_info)
+            else:
+                yield emit("progress", "未检测到电视剧信息，继续搜索夸克资源...")
+
             search_query = SEARCH_QUERY_TEMPLATE.format(query=query)
             yield emit("progress", f'正在搜索: "{search_query}"')
 
-            # ──── 步骤 1: Google 搜索 ────
-            try:
-                encoded_query = quote(search_query)
-                engine_name = "Google"
-                google_url = f"https://www.google.com/search?q={encoded_query}&hl=zh-CN&num=20"
-                yield emit("progress", "正在通过 Google 搜索...", {"engine": engine_name})
+            # ──── 多引擎级联搜索：Google → Bing → 百度 ────
+            # 每个引擎搜完后检查是否找到夸克链接，没找到就试下一个
+            encoded_query = quote(search_query)
+            links = []
+            raw_result_links = []
 
-                await page.goto(google_url, wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(2)  # 等待加载
+            # 定义搜索引擎配置
+            engines = [
+                {
+                    "name": "Google",
+                    "url": f"https://www.google.com/search?q={encoded_query}&hl=zh-CN&num=20",
+                    "check_captcha": True,
+                },
+                {
+                    "name": "Bing",
+                    "url": f"https://cn.bing.com/search?q={encoded_query}&count=20&setlang=zh-Hans",
+                    "check_captcha": False,
+                },
+                {
+                    "name": "Baidu",
+                    "url": f"https://www.baidu.com/s?wd={encoded_query}&rn=20",
+                    "check_captcha": False,
+                },
+            ]
 
-                # 检查是否被拦截
-                title = await page.title()
-                if "sorry" in title.lower() or "unusual traffic" in title.lower():
-                    yield emit("progress", "Google 检测到异常流量，切换到 Bing 搜索...")
-                    raise Exception("Google captcha")
-
-                # 获取所有链接
-                content = await page.content()
-                links = extract_quark_links(content)
-
-                # 也尝试获取搜索结果链接
-                result_links = await page.evaluate('''
-                    () => {
-                        const links = [];
-                        document.querySelectorAll('a[href]').forEach(a => {
-                            const href = a.href;
-                            if (href && href.includes('quark.cn')) {
-                                links.push(href);
-                            }
-                        });
-                        return links;
-                    }
-                ''')
-                links.extend(result_links)
-                links = list(set(links))
-
-            except Exception as e:
-                # Google 失败，尝试 Bing
-                yield emit("progress", f"Google 搜索失败 ({str(e)[:50]})，尝试 Bing...")
+            for eng in engines:
+                eng_name = eng["name"]
+                eng_url = eng["url"]
+                engine_name = eng_name
+                yield emit("progress", f"正在通过 {eng_name} 搜索...", {"engine": eng_name})
                 try:
-                    engine_name = "Bing"
-                    encoded_query = quote(search_query)
-                    bing_url = f"https://www.bing.com/search?q={encoded_query}&count=20"
-                    await page.goto(bing_url, wait_until="domcontentloaded", timeout=30000)
+                    await page.goto(eng_url, wait_until="domcontentloaded", timeout=30000)
                     await asyncio.sleep(2)
 
-                    content = await page.content()
-                    links = extract_quark_links(content)
+                    # Google CAPTCHA 检测
+                    if eng["check_captcha"]:
+                        current_url = page.url
+                        title = await page.title()
+                        if "sorry" in current_url or "sorry" in title.lower() or "unusual traffic" in title.lower():
+                            yield emit("progress", f"{eng_name} 检测到 CAPTCHA，切换到下一个引擎...")
+                            continue
 
+                    # 从 HTML 中正则提取 quark 链接
+                    content = await page.content()
+                    eng_links = extract_quark_links(content)
+
+                    # 也从 <a> 标签提取
                     result_links = await page.evaluate('''
                         () => {
                             const links = [];
                             document.querySelectorAll('a[href]').forEach(a => {
-                                const href = a.href;
-                                if (href && href.includes('quark.cn')) {
-                                    links.push(href);
-                                }
+                                if (a.href && a.href.includes('quark.cn') && a.href.includes('/s/')) links.push(a.href);
                             });
                             return links;
                         }
                     ''')
-                    links.extend(result_links)
-                    links = list(set(links))
-                except Exception as e2:
-                    yield emit("error", f"所有搜索引擎均失败: {str(e2)[:100]}")
-                    await browser.close()
-                    return
+                    eng_links.extend(result_links)
+                    eng_links = list(set(eng_links))
 
-            # ──── 同时提取搜索结果中的非夸克页面链接（用来做二级挖掘）────
-            non_quark_result_links = await page.evaluate(f'''
-                () => {{
-                    const links = [];
-                    const seen = new Set();
-                    const selectors = [
-                        '#search .g a[href]', '#search .yuRUbf a[href]',
-                        '#rso a[href]', '#b_results .b_algo h2 a[href]',
-                        '.b_algo a[href]', 'h2 a[href]', '.g h3 a[href]'
-                    ];
-                    for (const sel of selectors) {{
-                        try {{
-                            document.querySelectorAll(sel).forEach(a => {{
-                                const href = a.href;
-                                if (href && href.startsWith('http') && !href.includes('quark.cn')
-                                    && !href.includes('google.com') && !href.includes('bing.com')
-                                    && !href.includes('youtube.com') && !seen.has(href)) {{
-                                    seen.add(href);
-                                    links.push(href);
-                                }}
-                            }});
-                        }} catch(e) {{}}
-                    }}
-                    return links.slice(0, 8);
-                }}
-            ''')
-            non_quark_result_links = list(dict.fromkeys(non_quark_result_links))[:8]  # 去重，最多8个
+                    # 提取非夸克搜索结果链接（用于二级挖掘）
+                    eng_raw_links = await page.evaluate("""
+                        () => {
+                            const links = [];
+                            const seen = new Set();
+                            const selectors = [
+                                '#search .g a[href]', '#search .yuRUbf a[href]',
+                                '#rso a[href]', '#b_results .b_algo h2 a[href]',
+                                '.b_algo a[href]', 'h2 a[href]', '.g h3 a[href]',
+                                '.b_algo h2 a', 'h2 a',
+                                '#content_left .result a[href]', '#content_left .c-container a[href]',
+                                '.result a[href]', '.c-container h3 a[href]'
+                            ];
+                            for (const sel of selectors) {
+                                try {
+                                    document.querySelectorAll(sel).forEach(a => {
+                                        const href = a.href;
+                                        if (href && href.startsWith('http') && !seen.has(href)) {
+                                            seen.add(href);
+                                            links.push(href);
+                                        }
+                                    });
+                                } catch(e) {}
+                            }
+                            return links;
+                        }
+                    """)
 
-            # ──── 过滤直接搜到的 quark.cn 链接 ────
-            quark_links = [l for l in links if 'quark.cn' in l]
+                    # 解码 Bing 重定向链接
+                    for raw_link in eng_raw_links:
+                        if 'bing.com/ck/' in raw_link:
+                            real_url = decode_bing_redirect(raw_link)
+                            if real_url != raw_link and 'quark.cn' in real_url:
+                                eng_links.append(real_url)
+                            elif real_url != raw_link and real_url.startswith('http'):
+                                skip_domains = ['google.com', 'bing.com', 'youtube.com', 'microsoft.com', 'baidu.com']
+                                if not any(d in real_url for d in skip_domains):
+                                    raw_result_links.append(real_url)
+                        elif not any(d in raw_link for d in ['google.com', 'bing.com', 'baidu.com', 'youtube.com']):
+                            raw_result_links.append(raw_link)
+
+                    eng_links = list(set(eng_links))
+                    links.extend(eng_links)
+
+                    yield emit("progress", f"{eng_name} 找到 {len(eng_links)} 个夸克链接", {"engine": eng_name})
+
+                    if eng_links:
+                        break
+                    else:
+                        yield emit("progress", f"{eng_name} 未找到夸克链接，尝试下一个引擎...", {"engine": eng_name})
+
+                except Exception as e:
+                    yield emit("progress", f"{eng_name} 搜索出错: {str(e)[:50]}，尝试下一个引擎...")
+                    continue
+
+            # 去重非夸克链接
+            raw_result_links = list(dict.fromkeys(raw_result_links))[:8]
+            non_quark_result_links = raw_result_links
+
+            # ──── 过滤直接搜到的 quark.cn 分享链接 ────
+            quark_links = [l for l in links if is_quark_share_url(l)]
             quark_links = list(set(quark_links))[:10]
 
             yield emit("progress",
@@ -356,6 +698,14 @@ async def search_with_playwright(query: str) -> AsyncGenerator[dict, None]:
                         "password_hint": resource_info.get('password_hint', ''),
                         "page_text_preview": page_text[:500],
                     }
+
+                    # 剧集比对
+                    if series_info.get('is_series') and series_info.get('total_episodes', 0) > 0:
+                        quark_ep = extract_episodes_from_files(resource_info.get('files', []))
+                        ep_match = compare_episodes(quark_ep, series_info['total_episodes'])
+                        resource_data['episode_match'] = ep_match
+                        resource_data['quark_episodes'] = quark_ep
+
                     resources.append(resource_data)
 
                     file_count = len(resource_info.get('files', []))
@@ -385,6 +735,7 @@ async def search_with_playwright(query: str) -> AsyncGenerator[dict, None]:
                 {
                     "query": query,
                     "engine": engine_name,
+                    "series_info": series_info,
                     "total_links": len(quark_links),
                     "total_resources": len(resources),
                     "links": quark_links,
